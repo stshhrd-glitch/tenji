@@ -1,11 +1,16 @@
 // vision.js — 画像から点字の点を検出し、マス(セル)に組み立てる
 //
-// パイプライン:
-//   1. グレースケール化
-//   2. 適応的二値化(局所平均との差)
-//   3. 連結成分ラベリング → 点候補(ブロブ)抽出
-//   4. 点間ピッチ推定 → 行・列クラスタリング → セル格子への当てはめ
-//   5. 各セルの6点パターン(マスク)を出力
+// 検出モード:
+//   print   : 印刷された点字(暗い点)。適応的二値化 → ブロブ検出
+//   print-light: 明るい点(白点字の印刷など)
+//   emboss  : 実物の浮き出し点字。斜め光で「点の片側が明るく反対側が暗く」
+//             写る性質(点字OCR研究の定石)を使い、ハイライトと影のペアで
+//             点を検出する。逆向きペア(両面印刷の裏点)は除外する。
+//   auto    : print と emboss を両方試し、解読スコアが高い方を採用
+//
+// 共通パイプライン:
+//   点検出 → 孤立点除去 → ピッチ推定 → 傾き推定・回転補正
+//   → 行・セル格子当てはめ → 6点位置サンプリングで点の有無を確定 → 解読
 
 "use strict";
 
@@ -16,7 +21,6 @@ function toBinary(imageData, { threshC = 12, invert = false } = {}) {
   for (let i = 0; i < w * h; i++) {
     gray[i] = 0.299 * data[i * 4] + 0.587 * data[i * 4 + 1] + 0.114 * data[i * 4 + 2];
   }
-  // 積分画像で局所平均を高速計算
   const integ = new Float64Array((w + 1) * (h + 1));
   for (let y = 0; y < h; y++) {
     let rowSum = 0;
@@ -69,37 +73,29 @@ function findBlobs(bin, w, h) {
       if (py > 0 && bin[p - w] && !labels[p - w]) { labels[p - w] = nextLabel; stack.push(p - w); }
       if (py < h - 1 && bin[p + w] && !labels[p + w]) { labels[p + w] = nextLabel; stack.push(p + w); }
     }
-    blobs.push({
-      x: sx / area, y: sy / area, area,
-      bw: maxX - minX + 1, bh: maxY - minY + 1,
-    });
+    blobs.push({ x: sx / area, y: sy / area, area, bw: maxX - minX + 1, bh: maxY - minY + 1 });
   }
   return blobs;
 }
 
-// 点らしい形のブロブだけ残す
 function filterDotBlobs(blobs, w, h) {
   const maxDim = Math.max(6, w * 0.05);
   let dots = blobs.filter((b) => {
     if (b.area < 5) return false;
     if (b.bw > maxDim || b.bh > maxDim) return false;
     const aspect = b.bw / b.bh;
-    if (aspect < 0.35 || aspect > 2.8) return false;
-    const fill = b.area / (b.bw * b.bh);
-    return fill > 0.35;
+    if (aspect < 0.3 || aspect > 3.2) return false;
+    return b.area / (b.bw * b.bh) > 0.3;
   });
   if (dots.length < 4) return dots;
-  // サイズの中央値から大きく外れるものを除去(ノイズ・文字など)
   const sizes = dots.map((b) => Math.max(b.bw, b.bh)).sort((a, b) => a - b);
   const medSize = sizes[sizes.length >> 1];
-  dots = dots.filter((b) => {
+  return dots.filter((b) => {
     const s = Math.max(b.bw, b.bh);
     return s > medSize * 0.4 && s < medSize * 2.2;
   });
-  return dots;
 }
 
-// 各点の最近傍距離
 function nearestNeighborDists(dots) {
   return dots.map((a) => {
     let best = Infinity;
@@ -118,8 +114,7 @@ function median(arr) {
   return s[s.length >> 1];
 }
 
-// 傾き推定: 近接する点同士のベクトル角度を90°周期で折りたたみ、中央値をとる。
-// 点字の格子は水平・垂直に並ぶため、±45°以内の傾きを検出できる。
+// 傾き推定: 近接点ペアの角度を90°周期で折りたたんで中央値
 function estimateRotation(dots, pitch) {
   const angles = [];
   const HALF_PI = Math.PI / 2;
@@ -129,8 +124,8 @@ function estimateRotation(dots, pitch) {
       const dist = Math.hypot(dx, dy);
       if (dist < pitch * 0.6 || dist > pitch * 1.45) continue;
       let ang = Math.atan2(dy, dx);
-      ang = ((ang % HALF_PI) + HALF_PI) % HALF_PI; // [0, 90°)
-      if (ang > Math.PI / 4) ang -= HALF_PI;       // [-45°, 45°)
+      ang = ((ang % HALF_PI) + HALF_PI) % HALF_PI;
+      if (ang > Math.PI / 4) ang -= HALF_PI;
       angles.push(ang);
     }
   }
@@ -138,7 +133,6 @@ function estimateRotation(dots, pitch) {
   return median(angles);
 }
 
-// 座標値を許容差 tol でクラスタリング(1次元)
 function cluster1d(values, tol) {
   const sorted = [...values].sort((a, b) => a.v - b.v);
   const clusters = [];
@@ -154,95 +148,10 @@ function cluster1d(values, tol) {
   return clusters;
 }
 
-// 1行(最大3点行)の点集合をセル列に組み立てる
-function buildCellsForLine(lineDots, rowIndexOf, pitch, cellPitch) {
-  // 列クラスタリング(傾き補正済み座標を使う)
-  const colClusters = cluster1d(lineDots.map((d) => ({ v: d.rx, d })), pitch * 0.45);
-  if (!colClusters.length) return [];
-
-  // 列を格子(セル番号+左右)に割り当てる。最初の列が左列か右列か(パリティ)は
-  // 両方試して、解読できる文字が多い方を採用する。
-  const d = pitch, D = cellPitch;
-  const results = [];
-  for (const parity of [0, 1]) {
-    const x0 = colClusters[0].mean - (parity === 1 ? d : 0);
-    const cells = new Map(); // cellIdx -> {mask, dots:[], x}
-    let fitErr = 0; // 格子への当てはめ誤差の合計(ピッチ単位)
-    for (const col of colClusters) {
-      const rel = col.mean - x0;
-      // 候補の格子位置から最も近いものを選ぶ
-      const cGuess = Math.round(rel / D);
-      let best = null;
-      for (let c = Math.max(0, cGuess - 2); c <= cGuess + 2; c++) {
-        for (let side = 0; side <= 1; side++) {
-          const gx = c * D + side * d;
-          const err = Math.abs(rel - gx);
-          if (!best || err < best.err) best = { c, side, err };
-        }
-      }
-      if (!best) continue;
-      fitErr += best.err / d;
-      if (!cells.has(best.c)) cells.set(best.c, { mask: 0, dots: [], x: x0 + best.c * D });
-      const cell = cells.get(best.c);
-      for (const { d: dot } of col.items) {
-        const row = rowIndexOf.get(dot);
-        if (row == null) continue;
-        const dotNum = best.side === 0 ? row + 1 : row + 4;
-        cell.mask |= 1 << (dotNum - 1);
-        cell.dots.push(dot);
-      }
-    }
-    results.push({ parity, cells, fitErr });
-  }
-
-  // 各パリティを「格子の当てはめ誤差 + 解読できた文字数」で比較。
-  // 誤ったパリティでは列が斜めに吸着して誤差が大きくなるため、これが決定打になる。
-  const scored = results.map((r) => {
-    const masks = cellListToMasks(r.cells, D);
-    const { perCell } = window.Braille.decodeCells(masks.map((c) => c.mask));
-    let valid = 0, unknown = 0;
-    for (const pc of perCell) {
-      if (pc.label === "?") unknown++;
-      else if (pc.label && pc.label !== "␣") valid++;
-    }
-    const score = valid - 2 * unknown - 3 * r.fitErr;
-    return { r, score, masks };
-  });
-  scored.sort((a, b) => b.score - a.score);
-  return scored[0].masks;
-}
-
-// cells Map → 空白マスを補完したセル配列。
-// 空白マスにも x 座標を与え、あとで6点サンプリングの検証対象にする。
-function cellListToMasks(cellsMap, D) {
-  const idxs = [...cellsMap.keys()].sort((a, b) => a - b);
-  if (!idxs.length) return [];
-  const out = [];
-  let prev = null;
-  for (const idx of idxs) {
-    if (prev != null) {
-      const gap = idx - prev - 1;
-      const prevX = cellsMap.get(prev).x;
-      for (let k = 0; k < Math.min(gap, 2); k++) {
-        out.push({ mask: 0, x: D ? prevX + (k + 1) * D : null, dots: [] });
-      }
-    }
-    out.push(cellsMap.get(idx));
-    prev = idx;
-  }
-  return out;
-}
-
-// 各マスの6点位置を二値画像上で直接サンプリングし、点の有無を判定し直す。
-// ブロブ検出で落ちた薄い点を拾い、格子位置に合わない誤検出を捨てる。
-// 「6点のうちどこが目立っているか」をマス単位で相対比較するのが肝。
-function refineCellMasks(lines, bin, w, h, pitch, rot) {
-  const r = Math.max(1.5, pitch * 0.32);
-  const ri = Math.ceil(r);
-  // 傾き補正済み座標 (gx, gy) → 元画像座標に戻して前景率を測る
-  const coverage = (gx, gy) => {
-    const ox = (gx - rot.cx) * rot.cosT - (gy - rot.cy) * rot.sinT + rot.cx;
-    const oy = (gx - rot.cx) * rot.sinT + (gy - rot.cy) * rot.cosT + rot.cy;
+// ---- カバレッジ(円板内の前景率)ヘルパ ----
+function makeBinCoverage(bin, w, h) {
+  return (ox, oy, r) => {
+    const ri = Math.ceil(r);
     let fg = 0, n = 0;
     for (let dy = -ri; dy <= ri; dy++) {
       for (let dx = -ri; dx <= ri; dx++) {
@@ -255,40 +164,173 @@ function refineCellMasks(lines, bin, w, h, pitch, rot) {
     }
     return n ? fg / n : 0;
   };
+}
 
+// ---- 印刷点字: 単純なブロブ検出 ----
+function detectPrintDots(imageData, opts, invert) {
+  const { width: w, height: h } = imageData;
+  const bin = toBinary(imageData, { threshC: opts.threshC, invert });
+  const dots = filterDotBlobs(findBlobs(bin, w, h), w, h);
+  return { dots, coverage: makeBinCoverage(bin, w, h), kind: invert ? "print-light" : "print" };
+}
+
+// ---- 浮き出し点字: ハイライト+影のペア検出 ----
+function detectEmbossDots(imageData, opts) {
+  const { width: w, height: h } = imageData;
+  const brightBin = toBinary(imageData, { threshC: opts.threshC, invert: true });
+  const darkBin = toBinary(imageData, { threshC: opts.threshC, invert: false });
+  const brights = filterDotBlobs(findBlobs(brightBin, w, h), w, h);
+  const darks = filterDotBlobs(findBlobs(darkBin, w, h), w, h);
+  if (brights.length < 4 || darks.length < 4) return null;
+
+  const ms = median(brights.map((b) => Math.max(b.bw, b.bh)));
+  const maxD = ms * 2.6;
+
+  // 各ハイライトに最近傍の影を対応付け
+  const rawPairs = [];
+  for (const b of brights) {
+    let best = null;
+    for (const d of darks) {
+      const dist = Math.hypot(d.x - b.x, d.y - b.y);
+      if (dist < maxD && (!best || dist < best.dist)) best = { b, d, dist };
+    }
+    if (best) rawPairs.push(best);
+  }
+  if (rawPairs.length < 4) return null;
+
+  // 支配的なペア方向 = 照明の向き。方向がバラバラなら浮き出しではない
+  let sx = 0, sy = 0;
+  for (const p of rawPairs) {
+    sx += (p.d.x - p.b.x) / p.dist;
+    sy += (p.d.y - p.b.y) / p.dist;
+  }
+  const norm = Math.hypot(sx, sy);
+  if (norm < rawPairs.length * 0.45) return null;
+  const ux = sx / norm, uy = sy / norm;
+
+  // 支配方向に沿ったペアだけ採用(逆向き = 裏点は除外)。点中心はペアの中点
+  const dots = [];
+  const pairDists = [];
+  for (const p of rawPairs) {
+    const vx = p.d.x - p.b.x, vy = p.d.y - p.b.y;
+    if ((vx * ux + vy * uy) / p.dist < 0.6) continue;
+    dots.push({
+      x: (p.b.x + p.d.x) / 2, y: (p.b.y + p.d.y) / 2,
+      area: p.b.area, bw: p.b.bw, bh: p.b.bh,
+    });
+    pairDists.push(p.dist);
+  }
+  if (dots.length < 4) return null;
+
+  const pd = median(pairDists);
+  const vx = ux * pd / 2, vy = uy * pd / 2;
+  const bCov = makeBinCoverage(brightBin, w, h);
+  const dCov = makeBinCoverage(darkBin, w, h);
+  // 点中心の座標から、ハイライト側と影側の両方に前景があるかを見る
+  const coverage = (ox, oy, r) => Math.min(bCov(ox - vx, oy - vy, r), dCov(ox + vx, oy + vy, r));
+  return { dots, coverage, kind: "emboss" };
+}
+
+// ---- 1行のセル組み立て(左右列パリティは両方試して良い方) ----
+function buildCellsForLine(lineDots, rowIndexOf, pitch, cellPitch) {
+  const colClusters = cluster1d(lineDots.map((d) => ({ v: d.rx, d })), pitch * 0.45);
+  if (!colClusters.length) return [];
+  const d = pitch, D = cellPitch;
+  const results = [];
+  for (const parity of [0, 1]) {
+    const x0 = colClusters[0].mean - (parity === 1 ? d : 0);
+    const cells = new Map();
+    let fitErr = 0;
+    for (const col of colClusters) {
+      const rel = col.mean - x0;
+      const cGuess = Math.round(rel / D);
+      let best = null;
+      for (let c = Math.max(0, cGuess - 2); c <= cGuess + 2; c++) {
+        for (let side = 0; side <= 1; side++) {
+          const err = Math.abs(rel - (c * D + side * d));
+          if (!best || err < best.err) best = { c, side, err };
+        }
+      }
+      if (!best) continue;
+      fitErr += best.err / d;
+      if (!cells.has(best.c)) cells.set(best.c, { mask: 0, dots: [], x: x0 + best.c * D });
+      const cell = cells.get(best.c);
+      for (const { d: dot } of col.items) {
+        const row = rowIndexOf.get(dot);
+        if (row == null) continue;
+        cell.mask |= 1 << ((best.side === 0 ? row + 1 : row + 4) - 1);
+        cell.dots.push(dot);
+      }
+    }
+    results.push({ cells, fitErr });
+  }
+  const scored = results.map((r) => {
+    const masks = cellListToMasks(r.cells, D);
+    const { perCell } = window.Braille.decodeCells(masks.map((c) => c.mask));
+    let valid = 0, unknown = 0;
+    for (const pc of perCell) {
+      if (pc.label === "?" ) unknown++;
+      else if (pc.label && pc.label !== "␣") valid++;
+    }
+    return { score: valid - 2 * unknown - 3 * r.fitErr, masks };
+  });
+  scored.sort((a, b) => b.score - a.score);
+  return scored[0].masks;
+}
+
+function cellListToMasks(cellsMap, D) {
+  const idxs = [...cellsMap.keys()].sort((a, b) => a - b);
+  if (!idxs.length) return [];
+  const out = [];
+  let prev = null;
+  for (const idx of idxs) {
+    if (prev != null) {
+      const gap = idx - prev - 1;
+      const prevX = cellsMap.get(prev).x;
+      for (let k = 0; k < Math.min(gap, 2); k++) {
+        out.push({ mask: 0, x: prevX + (k + 1) * D, dots: [] });
+      }
+    }
+    out.push(cellsMap.get(idx));
+    prev = idx;
+  }
+  return out;
+}
+
+// ---- 6点サンプリング: 格子位置ごとに点の有無を判定し直す ----
+// 「6点のうちどこが目立っているか」を行内の相対比較で決めるのが肝。
+function refineCellMasks(lines, coverage, pitch, rot) {
+  const r = Math.max(1.5, pitch * 0.32);
+  const cov = (gx, gy) => {
+    const ox = (gx - rot.cx) * rot.cosT - (gy - rot.cy) * rot.sinT + rot.cx;
+    const oy = (gx - rot.cx) * rot.sinT + (gy - rot.cy) * rot.cosT + rot.cy;
+    return coverage(ox, oy, r);
+  };
   for (const line of lines) {
-    const samples = []; // {cell, bit, cov}
+    const samples = [];
     for (const cell of line.cells) {
       if (cell.x == null) continue;
       for (let side = 0; side <= 1; side++) {
         for (let row = 0; row < 3; row++) {
-          const cov = coverage(cell.x + side * pitch, line.rowYs[row]);
-          samples.push({ cell, bit: side * 3 + row, cov });
+          samples.push({ cell, bit: side * 3 + row, cov: cov(cell.x + side * pitch, line.rowYs[row]) });
         }
       }
     }
     if (!samples.length) continue;
     const cMax = Math.max(...samples.map((s) => s.cov));
     for (const cell of line.cells) if (cell.x != null) cell.mask = 0;
-    if (cMax < 0.15) continue; // 行全体に点が無い → 空行としてゲートで落ちる
-    // 最も目立つ点を基準に、その4割以上の濃さがある位置を「点あり」とする
+    if (cMax < 0.15) continue;
     const th = Math.max(0.12, cMax * 0.4);
-    for (const s of samples) {
-      if (s.cov >= th) s.cell.mask |= 1 << s.bit;
-    }
+    for (const s of samples) if (s.cov >= th) s.cell.mask |= 1 << s.bit;
   }
 }
 
-// メイン: ImageData → 検出結果
-function detectBraille(imageData, opts = {}) {
-  const { width: w, height: h } = imageData;
-  const bin = toBinary(imageData, opts);
-  const allBlobs = findBlobs(bin, w, h);
-  let dots = filterDotBlobs(allBlobs, w, h);
-  const empty = { dots, lines: [], pitch: 0, theta: 0, cx: w / 2, cy: h / 2, text: "" };
+// ---- 共通パイプライン ----
+function runPipeline(det, w, h) {
+  const empty = { dots: det.dots, lines: [], pitch: 0, theta: 0, cx: w / 2, cy: h / 2, text: "", score: 0, kind: det.kind };
+  let dots = det.dots;
   if (dots.length < 4) return empty;
 
-  // --- 孤立点(ノイズ)の除去: 最近傍距離が飛び抜けている点を捨てる ---
   let nn = nearestNeighborDists(dots);
   const nnMed = median(nn);
   dots = dots.filter((_, i) => nn[i] <= nnMed * 2.6);
@@ -297,7 +339,6 @@ function detectBraille(imageData, opts = {}) {
   const pitch = median(nn);
   if (!pitch || pitch < 3) return empty;
 
-  // --- 傾き補正: 推定角度で座標を回転してから格子に当てはめる ---
   const theta = estimateRotation(dots, pitch);
   const cx = w / 2, cy = h / 2;
   const cosT = Math.cos(theta), sinT = Math.sin(theta);
@@ -306,10 +347,7 @@ function detectBraille(imageData, opts = {}) {
     d.ry = -(d.x - cx) * sinT + (d.y - cy) * cosT + cy;
   }
 
-  // --- 行クラスタリング(点の行)---
   const rowClusters = cluster1d(dots.map((d) => ({ v: d.ry, d })), pitch * 0.45);
-
-  // --- 点行を「行(3点行のまとまり)」にグループ化 ---
   const lineGroups = [];
   for (const rc of rowClusters) {
     const last = lineGroups[lineGroups.length - 1];
@@ -320,18 +358,15 @@ function detectBraille(imageData, opts = {}) {
     }
   }
 
-  // --- セル間ピッチ(横方向)の推定 ---
   const xs = dots.map((d) => d.rx).sort((a, b) => a - b);
   const gaps = [];
   for (let i = 1; i < xs.length; i++) {
     const g = xs[i] - xs[i - 1];
     if (g > pitch * 1.25 && g < pitch * 2.6) gaps.push(g);
   }
-  gaps.sort((a, b) => a - b);
-  const interGap = gaps.length ? gaps[gaps.length >> 1] : pitch * 1.45;
+  const interGap = gaps.length ? median(gaps) : pitch * 1.45;
   const cellPitch = interGap + pitch;
 
-  // --- 各行のセル組み立てと行内の点→行番号の対応 ---
   const lines = [];
   for (const lg of lineGroups) {
     const rowIndexOf = new Map();
@@ -339,8 +374,7 @@ function detectBraille(imageData, opts = {}) {
     let rowIdxs;
     if (n === 3) rowIdxs = [0, 1, 2];
     else if (n === 2) {
-      const gap = lg.rows[1].mean - lg.rows[0].mean;
-      rowIdxs = gap > pitch * 1.55 ? [0, 2] : [0, 1];
+      rowIdxs = lg.rows[1].mean - lg.rows[0].mean > pitch * 1.55 ? [0, 2] : [0, 1];
     } else rowIdxs = [0];
     lg.rows.forEach((rc, i) => {
       for (const { d } of rc.items) rowIndexOf.set(d, rowIdxs[i]);
@@ -348,28 +382,20 @@ function detectBraille(imageData, opts = {}) {
     const lineDots = lg.rows.flatMap((rc) => rc.items.map((it) => it.d));
     const cells = buildCellsForLine(lineDots, rowIndexOf, pitch, cellPitch);
     if (cells.length) {
-      // 3点行それぞれの y 座標(検出できなかった行はピッチから補完)
       const rowYs = [null, null, null];
       lg.rows.forEach((rc, i) => { rowYs[rowIdxs[i]] = rc.mean; });
       if (rowYs[1] == null) rowYs[1] = rowYs[2] != null ? (rowYs[0] + rowYs[2]) / 2 : rowYs[0] + pitch;
       if (rowYs[2] == null) rowYs[2] = rowYs[1] + pitch;
-      lines.push({
-        y: rowYs[0],
-        cells,
-        rowYs,
-        top: rowYs[0] - pitch * 0.7,
-        bottom: rowYs[2] + pitch * 0.7,
-      });
+      lines.push({ y: rowYs[0], cells, rowYs, top: rowYs[0] - pitch * 0.7, bottom: rowYs[2] + pitch * 0.7 });
     }
   }
 
-  // --- 6点サンプリング: 格子位置ごとに二値画像を直接見て点の有無を判定し直す ---
-  refineCellMasks(lines, bin, w, h, pitch, { cosT, sinT, cx, cy });
+  refineCellMasks(lines, det.coverage, pitch, { cosT, sinT, cx, cy });
 
-  // --- 解読と品質ゲート ---
-  // 解読できたマスの割合が低い「行」はノイズとみなして出力しない。
+  // 解読と品質ゲート(解読率60%未満の行はノイズとして捨てる)
   const accepted = [];
   const texts = [];
+  let score = 0;
   for (const line of lines) {
     const { text, perCell } = window.Braille.decodeCells(line.cells.map((c) => c.mask));
     line.cells.forEach((c, i) => { c.label = perCell[i] ? perCell[i].label : ""; });
@@ -382,10 +408,33 @@ function detectBraille(imageData, opts = {}) {
     if (total >= 2 && valid / total >= 0.6) {
       accepted.push(line);
       texts.push(text);
+      score += valid;
     }
   }
+  return { dots, lines: accepted, pitch, cellPitch, theta, cx, cy, text: texts.join("\n"), score, kind: det.kind };
+}
 
-  return { dots, lines: accepted, pitch, cellPitch, theta, cx, cy, text: texts.join("\n") };
+// ---- メイン ----
+function detectBraille(imageData, opts = {}) {
+  const { width: w, height: h } = imageData;
+  const mode = opts.mode || "auto";
+  const candidates = [];
+  if (mode === "print" || mode === "auto") candidates.push(detectPrintDots(imageData, opts, false));
+  if (mode === "print-light") candidates.push(detectPrintDots(imageData, opts, true));
+  if (mode === "emboss" || mode === "auto") {
+    const e = detectEmbossDots(imageData, opts);
+    if (e) candidates.push(e);
+  }
+  let best = null, bestEmboss = null;
+  for (const det of candidates) {
+    const r = runPipeline(det, w, h);
+    if (!best || r.score > best.score) best = r;
+    if (r.kind === "emboss" && (!bestEmboss || r.score > bestEmboss.score)) bestEmboss = r;
+  }
+  // 明暗ペアの整合が取れた=浮き出し点字の強い証拠。影だけを「印刷の点」と
+  // 誤解した候補が同点程度で勝つのを防ぐため、僅差ならエンボスを優先する。
+  if (bestEmboss && best && bestEmboss.score >= best.score * 0.8) best = bestEmboss;
+  return best || { dots: [], lines: [], pitch: 0, theta: 0, cx: w / 2, cy: h / 2, text: "", score: 0, kind: mode };
 }
 
 window.Vision = { detectBraille };

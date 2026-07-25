@@ -20,15 +20,17 @@ function analyze() {
   const t0 = performance.now();
   const result = window.Vision.detectBraille(imageData, {
     threshC: Number($("thresh").value),
-    invert: $("invert").checked,
+    mode: $("mode").value,
   });
   const ms = (performance.now() - t0).toFixed(0);
 
+  const kindLabel = { print: "印刷(暗)", "print-light": "印刷(明)", emboss: "浮き出し" }[result.kind] || "";
   drawOverlay(result);
   $("output").textContent = result.text || "(点字を検出できませんでした)";
   $("stats").textContent =
     `点: ${result.dots.length} / 行: ${result.lines.length} / 処理時間: ${ms}ms` +
-    (result.pitch ? ` / ピッチ: ${result.pitch.toFixed(1)}px` : "");
+    (result.pitch ? ` / ピッチ: ${result.pitch.toFixed(1)}px` : "") +
+    (kindLabel ? ` / 判定: ${kindLabel}` : "");
 }
 
 function drawOverlay(result) {
@@ -185,6 +187,6 @@ window.addEventListener("DOMContentLoaded", () => {
     if (e.target.files[0]) loadImageFile(e.target.files[0]);
   });
   $("thresh").addEventListener("input", analyze);
-  $("invert").addEventListener("change", analyze);
+  $("mode").addEventListener("change", analyze);
   setMode("demo");
 });

@@ -39,6 +39,7 @@
   #output { font-size: 1.6rem; line-height: 1.5; white-space: pre-wrap; min-height: 1.5em; }
   #stats { margin-top: 8px; color: #777; font-size: 0.75rem; }
   input[type="file"] { color: #ccc; }
+  select { background: #2a2e36; color: #eee; border: 1px solid #444; border-radius: 6px; padding: 4px 8px; }
 </style>
 </head>
 <body>
@@ -63,7 +64,14 @@
 
   <div class="controls">
     <label>感度 <input type="range" id="thresh" min="4" max="40" value="12"></label>
-    <label><input type="checkbox" id="invert"> 明るい点(浮き出し点字向け)</label>
+    <label>種類
+      <select id="mode">
+        <option value="auto">自動判別</option>
+        <option value="emboss">実物の点字(浮き出し)</option>
+        <option value="print">印刷(暗い点)</option>
+        <option value="print-light">印刷(明るい点)</option>
+      </select>
+    </label>
   </div>
 
   <div class="viewer">
