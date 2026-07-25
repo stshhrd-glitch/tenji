@@ -88,11 +88,30 @@ function filterDotBlobs(blobs, w, h) {
     return b.area / (b.bw * b.bh) > 0.3;
   });
   if (dots.length < 4) return dots;
+
+  // サイズ分布を確認。点字一覧表のように「空き位置の小点 + 実点の大点」の
+  // 2群に分かれる場合は両群とも残す(格子推定に使い、点の有無は後段の
+  // サンプリングで大きさから判定する)。単峰なら中央値まわりだけ残す。
   const sizes = dots.map((b) => Math.max(b.bw, b.bh)).sort((a, b) => a - b);
-  const medSize = sizes[sizes.length >> 1];
+  const med = sizes[sizes.length >> 1];
+  let splitIdx = -1, bestRatio = 1.7;
+  for (let i = Math.ceil(sizes.length * 0.2); i <= Math.floor(sizes.length * 0.85); i++) {
+    const ratio = sizes[i] / Math.max(1, sizes[i - 1]);
+    if (ratio > bestRatio) { bestRatio = ratio; splitIdx = i; }
+  }
+  let lo, hi;
+  if (splitIdx > 0) {
+    const smallMed = sizes[splitIdx >> 1];
+    const bigMed = sizes[(splitIdx + sizes.length) >> 1];
+    lo = smallMed * 0.4;
+    hi = bigMed * 2.2;
+  } else {
+    lo = med * 0.4;
+    hi = med * 2.2;
+  }
   return dots.filter((b) => {
     const s = Math.max(b.bw, b.bh);
-    return s > medSize * 0.4 && s < medSize * 2.2;
+    return s > lo && s < hi;
   });
 }
 
@@ -231,10 +250,8 @@ function detectEmbossDots(imageData, opts) {
   return { dots, coverage, kind: "emboss" };
 }
 
-// ---- 1行のセル組み立て(左右列パリティは両方試して良い方) ----
-function buildCellsForLine(lineDots, rowIndexOf, pitch, cellPitch) {
-  const colClusters = cluster1d(lineDots.map((d) => ({ v: d.rx, d })), pitch * 0.45);
-  if (!colClusters.length) return [];
+// ---- 1つの連続区間(run)を格子に当てはめる(左右列パリティは両方試して良い方) ----
+function fitRun(colClusters, rowIndexOf, pitch, cellPitch) {
   const d = pitch, D = cellPitch;
   const results = [];
   for (const parity of [0, 1]) {
@@ -272,10 +289,43 @@ function buildCellsForLine(lineDots, rowIndexOf, pitch, cellPitch) {
       if (pc.label === "?" ) unknown++;
       else if (pc.label && pc.label !== "␣") valid++;
     }
-    return { score: valid - 2 * unknown - 3 * r.fitErr, masks };
+    return { score: valid - 2 * unknown - 3 * r.fitErr, masks, fitErr: r.fitErr };
   });
   scored.sort((a, b) => b.score - a.score);
-  return scored[0].masks;
+  return scored[0];
+}
+
+// ---- 1行のセル組み立て ----
+// 格子間隔として説明できない隙間(表のグループ間余白など)が出たら、
+// そこで格子を仕切り直して空白マスを挟む。
+function buildCellsForLine(lineDots, rowIndexOf, pitch, cellPitch) {
+  const colClusters = cluster1d(lineDots.map((d) => ({ v: d.rx, d })), pitch * 0.45);
+  if (!colClusters.length) return { cells: [], fitErrAvg: 9 };
+  const d = pitch, D = cellPitch;
+  // 連続した列同士として説明できる間隔(セル内 d、セル間 D-d、空列・空マスを含む)
+  const gapCands = [d, D - d, D, D + d];
+  const runs = [];
+  let current = [colClusters[0]];
+  for (let i = 1; i < colClusters.length; i++) {
+    const gap = colClusters[i].mean - colClusters[i - 1].mean;
+    const err = Math.min(...gapCands.map((g) => Math.abs(gap - g)));
+    // 大きな隙間(語間・グループ間)や格子で説明できない間隔では仕切り直す。
+    // 仕切り直しは「空白マス+独立の格子当てはめ」なので、連続していた場合も壊さない
+    if (gap > D * 1.6 || err > d * 0.35) { runs.push(current); current = []; }
+    current.push(colClusters[i]);
+  }
+  runs.push(current);
+
+  const cells = [];
+  let totalErr = 0, totalCols = 0;
+  for (const run of runs) {
+    const fit = fitRun(run, rowIndexOf, pitch, cellPitch);
+    if (cells.length && fit.masks.length) cells.push({ mask: 0, x: null, dots: [] });
+    cells.push(...fit.masks);
+    totalErr += fit.fitErr;
+    totalCols += run.length;
+  }
+  return { cells, fitErrAvg: totalCols ? totalErr / totalCols : 9 };
 }
 
 function cellListToMasks(cellsMap, D) {
@@ -380,13 +430,23 @@ function runPipeline(det, w, h) {
       for (const { d } of rc.items) rowIndexOf.set(d, rowIdxs[i]);
     });
     const lineDots = lg.rows.flatMap((rc) => rc.items.map((it) => it.d));
-    const cells = buildCellsForLine(lineDots, rowIndexOf, pitch, cellPitch);
+    const { cells, fitErrAvg } = buildCellsForLine(lineDots, rowIndexOf, pitch, cellPitch);
     if (cells.length) {
       const rowYs = [null, null, null];
       lg.rows.forEach((rc, i) => { rowYs[rowIdxs[i]] = rc.mean; });
       if (rowYs[1] == null) rowYs[1] = rowYs[2] != null ? (rowYs[0] + rowYs[2]) / 2 : rowYs[0] + pitch;
       if (rowYs[2] == null) rowYs[2] = rowYs[1] + pitch;
-      lines.push({ y: rowYs[0], cells, rowYs, top: rowYs[0] - pitch * 0.7, bottom: rowYs[2] + pitch * 0.7 });
+      // 点行の間隔がピッチ(または2ピッチ)に合っているか = 点字の行らしさ
+      let rowSpacErr = 0;
+      for (let i = 1; i < lg.rows.length; i++) {
+        const gap = lg.rows[i].mean - lg.rows[i - 1].mean;
+        rowSpacErr = Math.max(rowSpacErr, Math.min(Math.abs(gap - pitch), Math.abs(gap - 2 * pitch)) / pitch);
+      }
+      lines.push({
+        y: rowYs[0], cells, rowYs, fitErrAvg,
+        nRows: lg.rows.length, rowSpacErr,
+        top: rowYs[0] - pitch * 0.7, bottom: rowYs[2] + pitch * 0.7,
+      });
     }
   }
 
@@ -405,7 +465,10 @@ function runPipeline(det, w, h) {
       total++;
       if (!pc.label.startsWith("?")) valid++;
     }
-    if (total >= 2 && valid / total >= 0.6) {
+    // 解読率が低い行、格子への当てはめ誤差が大きい行、点字の行構造
+    // (点行2段以上・行間隔がピッチに一致)を持たない行はノイズとして捨てる
+    if (total >= 2 && valid / total >= 0.6 && line.fitErrAvg <= 0.3 &&
+        line.nRows >= 2 && line.rowSpacErr <= 0.3) {
       accepted.push(line);
       texts.push(text);
       score += valid;
