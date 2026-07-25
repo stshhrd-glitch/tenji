@@ -19,7 +19,7 @@ function analyze() {
 
   const t0 = performance.now();
   const result = window.Vision.detectBraille(imageData, {
-    threshC: Number($("thresh").value),
+    threshC: $("autoSens").checked ? null : Number($("thresh").value),
     mode: $("mode").value,
   });
   const ms = (performance.now() - t0).toFixed(0);
@@ -188,5 +188,9 @@ window.addEventListener("DOMContentLoaded", () => {
   });
   $("thresh").addEventListener("input", analyze);
   $("mode").addEventListener("change", analyze);
+  $("autoSens").addEventListener("change", () => {
+    $("thresh").disabled = $("autoSens").checked;
+    analyze();
+  });
   setMode("demo");
 });

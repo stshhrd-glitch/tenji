@@ -63,7 +63,8 @@
   </div>
 
   <div class="controls">
-    <label>感度 <input type="range" id="thresh" min="4" max="40" value="12"></label>
+    <label><input type="checkbox" id="autoSens" checked> 感度自動</label>
+    <label>手動感度 <input type="range" id="thresh" min="4" max="40" value="18" disabled></label>
     <label>種類
       <select id="mode">
         <option value="auto">自動判別</option>
@@ -85,8 +86,9 @@
     <div id="stats"></div>
   </div>
 
-  <script src="braille.js"></script>
-  <script src="vision.js"></script>
-  <script src="app.js"></script>
+  <!-- ?v= はデプロイごとに上げてブラウザキャッシュを無効化する -->
+  <script src="braille.js?v=9"></script>
+  <script src="vision.js?v=9"></script>
+  <script src="app.js?v=9"></script>
 </body>
 </html>

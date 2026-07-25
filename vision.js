@@ -514,6 +514,7 @@ function runPipeline(det, w, h) {
   const accepted = [];
   const texts = [];
   let score = 0;
+  let fullCells = 0, cellCount = 0;
   for (const line of lines) {
     const { text, perCell } = window.Braille.decodeCells(line.cells.map((c) => c.mask));
     line.cells.forEach((c, i) => { c.label = perCell[i] ? perCell[i].label : ""; });
@@ -526,31 +527,45 @@ function runPipeline(det, w, h) {
     // 解読率が低い行、格子への当てはめ誤差が大きい行、点字の行構造
     // (点行2段以上・行間隔がピッチに一致)を持たない行はノイズとして捨てる
     if (total >= 2 && valid / total >= 0.6 && line.fitErrAvg <= 0.3 &&
-        line.nRows >= 2 && line.rowSpacErr <= 0.3) {
+        line.nRows >= 2 && line.rowSpacErr <= 0.18) {
       accepted.push(line);
       texts.push(text);
       score += valid;
+      for (const c of line.cells) {
+        if (c.mask === 0) continue;
+        cellCount++;
+        if (c.mask === 0b111111) fullCells++;
+      }
     }
   }
+  // 全点あり(め)のマスが異常に多い候補は、空き位置まで点と誤判定して
+  // いる疑いが強い(「め」も有効文字なのでスコアが不当に伸びる)
+  score -= 2 * Math.max(0, fullCells - 0.15 * cellCount);
   return { dots, lines: accepted, pitch, cellPitch, theta, cx, cy, text: texts.join("\n"), score, kind: det.kind };
 }
 
 // ---- メイン ----
+// opts.threshC が未指定なら複数のしきい値を試して最良の解読結果を採用する
 function detectBraille(imageData, opts = {}) {
   const { width: w, height: h } = imageData;
   const mode = opts.mode || "auto";
-  const candidates = [];
-  if (mode === "print" || mode === "auto") candidates.push(detectPrintDots(imageData, opts, false));
-  if (mode === "print-light") candidates.push(detectPrintDots(imageData, opts, true));
-  if (mode === "emboss" || mode === "auto") {
-    const e = detectEmbossDots(imageData, opts);
-    if (e) candidates.push(e);
-  }
+  const threshCs = opts.threshC != null ? [opts.threshC] : [10, 18, 28];
+
   let best = null, bestEmboss = null;
-  for (const det of candidates) {
-    const r = runPipeline(det, w, h);
-    if (!best || r.score > best.score) best = r;
-    if (r.kind === "emboss" && (!bestEmboss || r.score > bestEmboss.score)) bestEmboss = r;
+  for (const threshC of threshCs) {
+    const o = { ...opts, threshC };
+    const candidates = [];
+    if (mode === "print" || mode === "auto") candidates.push(detectPrintDots(imageData, o, false));
+    if (mode === "print-light") candidates.push(detectPrintDots(imageData, o, true));
+    if (mode === "emboss" || mode === "auto") {
+      const e = detectEmbossDots(imageData, o);
+      if (e) candidates.push(e);
+    }
+    for (const det of candidates) {
+      const r = runPipeline(det, w, h);
+      if (!best || r.score > best.score) best = r;
+      if (r.kind === "emboss" && (!bestEmboss || r.score > bestEmboss.score)) bestEmboss = r;
+    }
   }
   // 明暗ペアの整合が取れた=浮き出し点字の強い証拠。影だけを「印刷の点」と
   // 誤解した候補が同点程度で勝つのを防ぐため、僅差ならエンボスを優先する。
