@@ -75,7 +75,7 @@ function findBlobs(bin, w, h) {
     }
     blobs.push({ x: sx / area, y: sy / area, area, bw: maxX - minX + 1, bh: maxY - minY + 1 });
   }
-  return blobs;
+  return { blobs, labels };
 }
 
 function filterDotBlobs(blobs, w, h) {
@@ -167,21 +167,29 @@ function cluster1d(values, tol) {
   return clusters;
 }
 
-// ---- カバレッジ(円板内の前景率)ヘルパ ----
-function makeBinCoverage(bin, w, h) {
-  return (ox, oy, r) => {
+// ---- ブロブ面積プローブ ----
+// 指定位置の周辺にある連結成分(塊)の面積を返す。
+// 点=小さな孤立した塊。巨大な塊(紙の外・影・文字など)は点ではないので0。
+function makeBlobProbe(labels, blobs, w, h) {
+  return (ox, oy, r, maxArea) => {
     const ri = Math.ceil(r);
-    let fg = 0, n = 0;
+    const counts = new Map();
+    let total = 0;
     for (let dy = -ri; dy <= ri; dy++) {
       for (let dx = -ri; dx <= ri; dx++) {
         if (dx * dx + dy * dy > r * r) continue;
         const px = Math.round(ox + dx), py = Math.round(oy + dy);
         if (px < 0 || py < 0 || px >= w || py >= h) continue;
-        n++;
-        fg += bin[py * w + px];
+        const lb = labels[py * w + px];
+        if (lb) { counts.set(lb, (counts.get(lb) || 0) + 1); total++; }
       }
     }
-    return n ? fg / n : 0;
+    if (!total) return 0;
+    let bestLb = 0, bestC = 0;
+    for (const [lb, c] of counts) if (c > bestC) { bestC = c; bestLb = lb; }
+    // 支配的な塊が巨大なら、それは紙の外・影・文字などであって点ではない
+    if (bestLb && blobs[bestLb - 1].area > maxArea) return 0;
+    return total;
   };
 }
 
@@ -189,8 +197,9 @@ function makeBinCoverage(bin, w, h) {
 function detectPrintDots(imageData, opts, invert) {
   const { width: w, height: h } = imageData;
   const bin = toBinary(imageData, { threshC: opts.threshC, invert });
-  const dots = filterDotBlobs(findBlobs(bin, w, h), w, h);
-  return { dots, coverage: makeBinCoverage(bin, w, h), kind: invert ? "print-light" : "print" };
+  const { blobs, labels } = findBlobs(bin, w, h);
+  const dots = filterDotBlobs(blobs, w, h);
+  return { dots, coverage: makeBlobProbe(labels, blobs, w, h), kind: invert ? "print-light" : "print" };
 }
 
 // ---- 浮き出し点字: ハイライト+影のペア検出 ----
@@ -198,8 +207,10 @@ function detectEmbossDots(imageData, opts) {
   const { width: w, height: h } = imageData;
   const brightBin = toBinary(imageData, { threshC: opts.threshC, invert: true });
   const darkBin = toBinary(imageData, { threshC: opts.threshC, invert: false });
-  const brights = filterDotBlobs(findBlobs(brightBin, w, h), w, h);
-  const darks = filterDotBlobs(findBlobs(darkBin, w, h), w, h);
+  const bFound = findBlobs(brightBin, w, h);
+  const dFound = findBlobs(darkBin, w, h);
+  const brights = filterDotBlobs(bFound.blobs, w, h);
+  const darks = filterDotBlobs(dFound.blobs, w, h);
   if (brights.length < 4 || darks.length < 4) return null;
 
   const ms = median(brights.map((b) => Math.max(b.bw, b.bh)));
@@ -243,10 +254,11 @@ function detectEmbossDots(imageData, opts) {
 
   const pd = median(pairDists);
   const vx = ux * pd / 2, vy = uy * pd / 2;
-  const bCov = makeBinCoverage(brightBin, w, h);
-  const dCov = makeBinCoverage(darkBin, w, h);
-  // 点中心の座標から、ハイライト側と影側の両方に前景があるかを見る
-  const coverage = (ox, oy, r) => Math.min(bCov(ox - vx, oy - vy, r), dCov(ox + vx, oy + vy, r));
+  const bProbe = makeBlobProbe(bFound.labels, bFound.blobs, w, h);
+  const dProbe = makeBlobProbe(dFound.labels, dFound.blobs, w, h);
+  // 点中心の座標から、ハイライト側と影側の両方に塊があるかを見る
+  const coverage = (ox, oy, r, maxArea) =>
+    Math.min(bProbe(ox - vx, oy - vy, r, maxArea), dProbe(ox + vx, oy + vy, r, maxArea));
   return { dots, coverage, kind: "emboss" };
 }
 
@@ -318,12 +330,31 @@ function buildCellsForLine(lineDots, rowIndexOf, pitch, cellPitch) {
 
   const cells = [];
   let totalErr = 0, totalCols = 0;
+  let lastX = null;
   for (const run of runs) {
     const fit = fitRun(run, rowIndexOf, pitch, cellPitch);
-    if (cells.length && fit.masks.length) cells.push({ mask: 0, x: null, dots: [] });
+    if (!fit.masks.length) continue;
+    if (cells.length) {
+      // run 間の隙間がセル間隔の整数倍なら、そこにプローブセルを置いて
+      // サンプリングで拾い直す(点が合体して列ごと消えたマスの復元)。
+      // 合わなければただの空白にする
+      const gap = fit.masks[0].x - lastX;
+      const miss = Math.round(gap / D) - 1;
+      if (miss >= 1 && miss <= 2 && Math.abs(gap - (miss + 1) * D) <= d * 0.6) {
+        for (let k = 1; k <= miss; k++) cells.push({ mask: 0, x: lastX + k * D, dots: [] });
+      } else {
+        cells.push({ mask: 0, x: null, dots: [] });
+      }
+    }
     cells.push(...fit.masks);
+    lastX = fit.masks[fit.masks.length - 1].x;
     totalErr += fit.fitErr;
     totalCols += run.length;
+  }
+  // 行頭・行末にもプローブを置く(見逃したマスの復元。空なら空白のまま)
+  if (cells.length) {
+    cells.unshift({ mask: 0, x: cells[0].x - D, dots: [] });
+    cells.push({ mask: 0, x: lastX + D, dots: [] }, { mask: 0, x: lastX + 2 * D, dots: [] });
   }
   return { cells, fitErrAvg: totalCols ? totalErr / totalCols : 9 };
 }
@@ -350,11 +381,15 @@ function cellListToMasks(cellsMap, D) {
 // ---- 6点サンプリング: 格子位置ごとに点の有無を判定し直す ----
 // 「6点のうちどこが目立っているか」を行内の相対比較で決めるのが肝。
 function refineCellMasks(lines, coverage, pitch, rot) {
-  const r = Math.max(1.5, pitch * 0.32);
+  // 捕捉半径は広めに取り、点全体の面積を拾う(隣の点位置とは1ピッチ離れて
+  // いるので 0.5 ピッチまでは安全)。値は基準点面積(半径0.32ピッチ)で正規化。
+  const rSearch = Math.max(2, pitch * 0.5);
+  const maxArea = Math.PI * Math.pow(pitch * 1.5, 2); // これより大きい塊は点ではない
+  const norm = Math.PI * Math.pow(Math.max(1.5, pitch * 0.32), 2);
   const cov = (gx, gy) => {
     const ox = (gx - rot.cx) * rot.cosT - (gy - rot.cy) * rot.sinT + rot.cx;
     const oy = (gx - rot.cx) * rot.sinT + (gy - rot.cy) * rot.cosT + rot.cy;
-    return coverage(ox, oy, r);
+    return coverage(ox, oy, rSearch, maxArea) / norm;
   };
   for (const line of lines) {
     const samples = [];
@@ -367,10 +402,33 @@ function refineCellMasks(lines, coverage, pitch, rot) {
       }
     }
     if (!samples.length) continue;
-    const cMax = Math.max(...samples.map((s) => s.cov));
+    const vals = samples.map((s) => s.cov).sort((a, b) => b - a);
+    if (window.__DEBUG_VISION) (window.__dbgVals = window.__dbgVals || []).push(vals.map((v) => +v.toFixed(2)));
+    const cMax = vals[0];
     for (const cell of line.cells) if (cell.x != null) cell.mask = 0;
     if (cMax < 0.15) continue;
-    const th = Math.max(0.12, cMax * 0.4);
+    // しきい値: 値の分布を2群に分ける(大津の方法)。実点の群と
+    // 「空き位置の小点・背景」の群の平均が明確に離れていればその境界で切る。
+    // 分布が一様(全点ありの行など)なら最大値の4割で切る。
+    let th = Math.max(0.12, cMax * 0.4);
+    const n = vals.length;
+    let bestK = -1, bestVar = 0;
+    let sumAll = vals.reduce((s, v) => s + v, 0);
+    let sumHi = 0;
+    for (let k = 1; k < n; k++) {
+      sumHi += vals[k - 1];
+      const meanHi = sumHi / k;
+      const meanLo = (sumAll - sumHi) / (n - k);
+      const between = k * (n - k) * (meanHi - meanLo) * (meanHi - meanLo);
+      if (between > bestVar) { bestVar = between; bestK = k; }
+    }
+    if (bestK > 0) {
+      const meanHi = vals.slice(0, bestK).reduce((s, v) => s + v, 0) / bestK;
+      const meanLo = vals.slice(bestK).reduce((s, v) => s + v, 0) / (n - bestK);
+      if (meanHi / Math.max(meanLo, 0.05) >= 1.7) {
+        th = Math.max(0.12, (vals[bestK - 1] + vals[bestK]) / 2);
+      }
+    }
     for (const s of samples) if (s.cov >= th) s.cell.mask |= 1 << s.bit;
   }
 }
