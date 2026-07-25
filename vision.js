@@ -198,7 +198,7 @@ function buildCellsForLine(lineDots, rowIndexOf, pitch, cellPitch) {
   // 各パリティを「格子の当てはめ誤差 + 解読できた文字数」で比較。
   // 誤ったパリティでは列が斜めに吸着して誤差が大きくなるため、これが決定打になる。
   const scored = results.map((r) => {
-    const masks = cellListToMasks(r.cells);
+    const masks = cellListToMasks(r.cells, D);
     const { perCell } = window.Braille.decodeCells(masks.map((c) => c.mask));
     let valid = 0, unknown = 0;
     for (const pc of perCell) {
@@ -212,8 +212,9 @@ function buildCellsForLine(lineDots, rowIndexOf, pitch, cellPitch) {
   return scored[0].masks;
 }
 
-// cells Map → 空白マスを補完したセル配列
-function cellListToMasks(cellsMap) {
+// cells Map → 空白マスを補完したセル配列。
+// 空白マスにも x 座標を与え、あとで6点サンプリングの検証対象にする。
+function cellListToMasks(cellsMap, D) {
   const idxs = [...cellsMap.keys()].sort((a, b) => a - b);
   if (!idxs.length) return [];
   const out = [];
@@ -221,12 +222,61 @@ function cellListToMasks(cellsMap) {
   for (const idx of idxs) {
     if (prev != null) {
       const gap = idx - prev - 1;
-      for (let k = 0; k < Math.min(gap, 2); k++) out.push({ mask: 0, x: null, dots: [] });
+      const prevX = cellsMap.get(prev).x;
+      for (let k = 0; k < Math.min(gap, 2); k++) {
+        out.push({ mask: 0, x: D ? prevX + (k + 1) * D : null, dots: [] });
+      }
     }
     out.push(cellsMap.get(idx));
     prev = idx;
   }
   return out;
+}
+
+// 各マスの6点位置を二値画像上で直接サンプリングし、点の有無を判定し直す。
+// ブロブ検出で落ちた薄い点を拾い、格子位置に合わない誤検出を捨てる。
+// 「6点のうちどこが目立っているか」をマス単位で相対比較するのが肝。
+function refineCellMasks(lines, bin, w, h, pitch, rot) {
+  const r = Math.max(1.5, pitch * 0.32);
+  const ri = Math.ceil(r);
+  // 傾き補正済み座標 (gx, gy) → 元画像座標に戻して前景率を測る
+  const coverage = (gx, gy) => {
+    const ox = (gx - rot.cx) * rot.cosT - (gy - rot.cy) * rot.sinT + rot.cx;
+    const oy = (gx - rot.cx) * rot.sinT + (gy - rot.cy) * rot.cosT + rot.cy;
+    let fg = 0, n = 0;
+    for (let dy = -ri; dy <= ri; dy++) {
+      for (let dx = -ri; dx <= ri; dx++) {
+        if (dx * dx + dy * dy > r * r) continue;
+        const px = Math.round(ox + dx), py = Math.round(oy + dy);
+        if (px < 0 || py < 0 || px >= w || py >= h) continue;
+        n++;
+        fg += bin[py * w + px];
+      }
+    }
+    return n ? fg / n : 0;
+  };
+
+  for (const line of lines) {
+    const samples = []; // {cell, bit, cov}
+    for (const cell of line.cells) {
+      if (cell.x == null) continue;
+      for (let side = 0; side <= 1; side++) {
+        for (let row = 0; row < 3; row++) {
+          const cov = coverage(cell.x + side * pitch, line.rowYs[row]);
+          samples.push({ cell, bit: side * 3 + row, cov });
+        }
+      }
+    }
+    if (!samples.length) continue;
+    const cMax = Math.max(...samples.map((s) => s.cov));
+    for (const cell of line.cells) if (cell.x != null) cell.mask = 0;
+    if (cMax < 0.15) continue; // 行全体に点が無い → 空行としてゲートで落ちる
+    // 最も目立つ点を基準に、その4割以上の濃さがある位置を「点あり」とする
+    const th = Math.max(0.12, cMax * 0.4);
+    for (const s of samples) {
+      if (s.cov >= th) s.cell.mask |= 1 << s.bit;
+    }
+  }
 }
 
 // メイン: ImageData → 検出結果
@@ -298,14 +348,23 @@ function detectBraille(imageData, opts = {}) {
     const lineDots = lg.rows.flatMap((rc) => rc.items.map((it) => it.d));
     const cells = buildCellsForLine(lineDots, rowIndexOf, pitch, cellPitch);
     if (cells.length) {
+      // 3点行それぞれの y 座標(検出できなかった行はピッチから補完)
+      const rowYs = [null, null, null];
+      lg.rows.forEach((rc, i) => { rowYs[rowIdxs[i]] = rc.mean; });
+      if (rowYs[1] == null) rowYs[1] = rowYs[2] != null ? (rowYs[0] + rowYs[2]) / 2 : rowYs[0] + pitch;
+      if (rowYs[2] == null) rowYs[2] = rowYs[1] + pitch;
       lines.push({
-        y: lg.rows[0].mean,
+        y: rowYs[0],
         cells,
-        top: lg.rows[0].mean - pitch * 0.7,
-        bottom: lg.rows[lg.rows.length - 1].mean + pitch * 0.7,
+        rowYs,
+        top: rowYs[0] - pitch * 0.7,
+        bottom: rowYs[2] + pitch * 0.7,
       });
     }
   }
+
+  // --- 6点サンプリング: 格子位置ごとに二値画像を直接見て点の有無を判定し直す ---
+  refineCellMasks(lines, bin, w, h, pitch, { cosT, sinT, cx, cy });
 
   // --- 解読と品質ゲート ---
   // 解読できたマスの割合が低い「行」はノイズとみなして出力しない。
