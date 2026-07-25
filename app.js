@@ -49,7 +49,11 @@ function drawOverlay(result) {
     ctx.arc(d.x * scale, d.y * scale, Math.max(3, result.pitch * 0.3) * scale, 0, Math.PI * 2);
     ctx.stroke();
   }
-  // セル枠と読み
+  // セル枠と読み(格子は傾き補正済み座標なので、逆回転して元画像に重ねる)
+  ctx.save();
+  ctx.translate(result.cx * scale, result.cy * scale);
+  ctx.rotate(result.theta || 0);
+  ctx.translate(-result.cx * scale, -result.cy * scale);
   ctx.font = `${Math.max(11, result.pitch * 1.1 * scale)}px sans-serif`;
   ctx.textAlign = "center";
   for (const line of result.lines) {
@@ -65,6 +69,7 @@ function drawOverlay(result) {
       }
     }
   }
+  ctx.restore();
 }
 
 // ---- デモ: テキスト → 点字画像 ----

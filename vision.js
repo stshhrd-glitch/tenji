@@ -99,21 +99,43 @@ function filterDotBlobs(blobs, w, h) {
   return dots;
 }
 
-// 隣接する点同士の距離の中央値 = ピッチ(セル内の点間隔)
-function estimatePitch(dots) {
-  if (dots.length < 2) return 0;
-  const dists = [];
-  for (const a of dots) {
+// 各点の最近傍距離
+function nearestNeighborDists(dots) {
+  return dots.map((a) => {
     let best = Infinity;
     for (const b of dots) {
       if (a === b) continue;
       const d = Math.hypot(a.x - b.x, a.y - b.y);
       if (d < best) best = d;
     }
-    dists.push(best);
+    return best;
+  });
+}
+
+function median(arr) {
+  if (!arr.length) return 0;
+  const s = [...arr].sort((a, b) => a - b);
+  return s[s.length >> 1];
+}
+
+// 傾き推定: 近接する点同士のベクトル角度を90°周期で折りたたみ、中央値をとる。
+// 点字の格子は水平・垂直に並ぶため、±45°以内の傾きを検出できる。
+function estimateRotation(dots, pitch) {
+  const angles = [];
+  const HALF_PI = Math.PI / 2;
+  for (let i = 0; i < dots.length; i++) {
+    for (let j = i + 1; j < dots.length; j++) {
+      const dx = dots[j].x - dots[i].x, dy = dots[j].y - dots[i].y;
+      const dist = Math.hypot(dx, dy);
+      if (dist < pitch * 0.6 || dist > pitch * 1.45) continue;
+      let ang = Math.atan2(dy, dx);
+      ang = ((ang % HALF_PI) + HALF_PI) % HALF_PI; // [0, 90°)
+      if (ang > Math.PI / 4) ang -= HALF_PI;       // [-45°, 45°)
+      angles.push(ang);
+    }
   }
-  dists.sort((a, b) => a - b);
-  return dists[dists.length >> 1];
+  if (angles.length < 4) return 0;
+  return median(angles);
 }
 
 // 座標値を許容差 tol でクラスタリング(1次元)
@@ -134,8 +156,8 @@ function cluster1d(values, tol) {
 
 // 1行(最大3点行)の点集合をセル列に組み立てる
 function buildCellsForLine(lineDots, rowIndexOf, pitch, cellPitch) {
-  // 列クラスタリング
-  const colClusters = cluster1d(lineDots.map((d) => ({ v: d.x, d })), pitch * 0.45);
+  // 列クラスタリング(傾き補正済み座標を使う)
+  const colClusters = cluster1d(lineDots.map((d) => ({ v: d.rx, d })), pitch * 0.45);
   if (!colClusters.length) return [];
 
   // 列を格子(セル番号+左右)に割り当てる。最初の列が左列か右列か(パリティ)は
@@ -212,15 +234,30 @@ function detectBraille(imageData, opts = {}) {
   const { width: w, height: h } = imageData;
   const bin = toBinary(imageData, opts);
   const allBlobs = findBlobs(bin, w, h);
-  const dots = filterDotBlobs(allBlobs, w, h);
-  const empty = { dots, lines: [], pitch: 0, text: "" };
-  if (dots.length < 2) return empty;
+  let dots = filterDotBlobs(allBlobs, w, h);
+  const empty = { dots, lines: [], pitch: 0, theta: 0, cx: w / 2, cy: h / 2, text: "" };
+  if (dots.length < 4) return empty;
 
-  const pitch = estimatePitch(dots);
+  // --- 孤立点(ノイズ)の除去: 最近傍距離が飛び抜けている点を捨てる ---
+  let nn = nearestNeighborDists(dots);
+  const nnMed = median(nn);
+  dots = dots.filter((_, i) => nn[i] <= nnMed * 2.6);
+  if (dots.length < 4) return empty;
+  nn = nearestNeighborDists(dots);
+  const pitch = median(nn);
   if (!pitch || pitch < 3) return empty;
 
+  // --- 傾き補正: 推定角度で座標を回転してから格子に当てはめる ---
+  const theta = estimateRotation(dots, pitch);
+  const cx = w / 2, cy = h / 2;
+  const cosT = Math.cos(theta), sinT = Math.sin(theta);
+  for (const d of dots) {
+    d.rx = (d.x - cx) * cosT + (d.y - cy) * sinT + cx;
+    d.ry = -(d.x - cx) * sinT + (d.y - cy) * cosT + cy;
+  }
+
   // --- 行クラスタリング(点の行)---
-  const rowClusters = cluster1d(dots.map((d) => ({ v: d.y, d })), pitch * 0.45);
+  const rowClusters = cluster1d(dots.map((d) => ({ v: d.ry, d })), pitch * 0.45);
 
   // --- 点行を「行(3点行のまとまり)」にグループ化 ---
   const lineGroups = [];
@@ -234,7 +271,7 @@ function detectBraille(imageData, opts = {}) {
   }
 
   // --- セル間ピッチ(横方向)の推定 ---
-  const xs = dots.map((d) => d.x).sort((a, b) => a - b);
+  const xs = dots.map((d) => d.rx).sort((a, b) => a - b);
   const gaps = [];
   for (let i = 1; i < xs.length; i++) {
     const g = xs[i] - xs[i - 1];
@@ -270,14 +307,26 @@ function detectBraille(imageData, opts = {}) {
     }
   }
 
-  // --- 解読 ---
-  const decodedLines = lines.map((line) => {
+  // --- 解読と品質ゲート ---
+  // 解読できたマスの割合が低い「行」はノイズとみなして出力しない。
+  const accepted = [];
+  const texts = [];
+  for (const line of lines) {
     const { text, perCell } = window.Braille.decodeCells(line.cells.map((c) => c.mask));
     line.cells.forEach((c, i) => { c.label = perCell[i] ? perCell[i].label : ""; });
-    return text;
-  });
+    let valid = 0, total = 0;
+    for (const pc of perCell) {
+      if (!pc.label || pc.label === "␣") continue;
+      total++;
+      if (!pc.label.startsWith("?")) valid++;
+    }
+    if (total >= 2 && valid / total >= 0.6) {
+      accepted.push(line);
+      texts.push(text);
+    }
+  }
 
-  return { dots, lines, pitch, cellPitch, text: decodedLines.join("\n") };
+  return { dots, lines: accepted, pitch, cellPitch, theta, cx, cy, text: texts.join("\n") };
 }
 
 window.Vision = { detectBraille };
